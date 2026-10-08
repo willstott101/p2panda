@@ -341,6 +341,7 @@ where
                         state.sync_args.clone(),
                         from_sync_tx,
                         state.endpoint.clone(),
+                        state.hooks.clone(),
                     ),
                     myself.clone().into(),
                     state.thread_pool.clone(),
