@@ -29,6 +29,7 @@ use tracing::{debug, warn};
 use crate::iroh_endpoint::Endpoint;
 use crate::sync::actors::poller::{SyncPoller, ToSyncPoller};
 use crate::sync::actors::session::{SyncSession, SyncSessionId, SyncSessionMessage};
+use crate::sync::hooks::{AfterHandshakeOutcome, SyncHooks, SyncHooksList};
 use crate::utils::ShortFormat;
 use crate::{NodeId, ProtocolId};
 
@@ -91,6 +92,7 @@ where
     next_session_id: SyncSessionId,
     sync_poller_actor: ActorRef<ToSyncPoller>,
     endpoint: Endpoint,
+    hooks: SyncHooksList<Topic>,
     pool: ThreadLocalActorSpawner,
 }
 
@@ -121,6 +123,7 @@ where
         M::Args,
         broadcast::Sender<FromSync<M::Event>>,
         Endpoint,
+        SyncHooksList<Topic>,
     );
 
     async fn pre_start(
@@ -128,7 +131,7 @@ where
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let (protocol_id, topic, config, sender, endpoint) = args;
+        let (protocol_id, topic, config, sender, endpoint, hooks) = args;
         let pool = ThreadLocalActorSpawner::new();
 
         let mut manager = M::from_args(config);
@@ -151,6 +154,7 @@ where
             actor_session_id_map: HashMap::new(),
             sync_poller_actor,
             endpoint,
+            hooks,
             pool,
         })
     }
@@ -239,6 +243,26 @@ where
                         %live_mode,
                         "skip re-initiate sync: other sync sessions already running"
                     );
+                    return Ok(());
+                }
+
+                // Authorise the retry like any other outgoing sync session. The hooks accepted
+                // this node when the failed session was initiated, but their answer may have
+                // changed since.
+                if let AfterHandshakeOutcome::Reject =
+                    state.hooks.after_handshake(node_id, &state.topic).await
+                {
+                    debug!(
+                        remote = %node_id.fmt_short(),
+                        topic = %state.topic.fmt_short(),
+                        %live_mode,
+                        "skip re-initiate sync: hooks rejected sync session"
+                    );
+
+                    // A rejected node is not synced with, same as if the hooks had rejected the
+                    // first attempt.
+                    state.active_sync_set.remove(&node_id);
+
                     return Ok(());
                 }
 

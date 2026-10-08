@@ -25,7 +25,7 @@ use crate::gossip::Gossip;
 use crate::iroh_endpoint::Endpoint;
 use crate::sync::actors::{SyncManager, ToSyncManager};
 use crate::sync::authoriser::SyncBlockList;
-use crate::sync::handle::SyncHandle;
+use crate::sync::handle::{SyncHandle, SyncSubscription};
 use crate::sync::hooks::SyncHooksList;
 use crate::test_utils::{ApplicationArguments, test_args_from_seed};
 
@@ -33,6 +33,7 @@ const TEST_PROTOCOL_ID: [u8; 32] = [101; 32];
 
 struct FailingNode {
     args: ApplicationArguments,
+    block_list: SyncBlockList,
     sync_ref: ActorRef<ToSyncManager<DummySyncMessage, DummySyncEvent>>,
 }
 
@@ -65,8 +66,9 @@ impl FailingNode {
 
         let thread_pool = ThreadLocalActorSpawner::new();
 
+        let block_list = SyncBlockList::default();
         let mut hooks = SyncHooksList::new();
-        hooks.push(SyncBlockList::default());
+        hooks.push(block_list.clone());
 
         let (sync_ref, _) =
             SyncManager::<DummySyncManager<FailingSyncArgs, FailingSyncProtocol>>::spawn(
@@ -83,7 +85,11 @@ impl FailingNode {
             .await
             .unwrap();
 
-        Self { args, sync_ref }
+        Self {
+            args,
+            block_list,
+            sync_ref,
+        }
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -299,4 +305,90 @@ async fn failed_sync_session_retry() {
         alice.shutdown();
         bob.shutdown();
     }
+}
+
+/// Sessions fail after 200ms and are retried 5 seconds later, this waits long enough to observe a
+/// retry if there is one.
+const RETRY_OBSERVATION_WINDOW: Duration = Duration::from_secs(7);
+
+/// Spawns Alice and Bob, lets Alice initiate a sync session with Bob which is going to fail and
+/// awaits it being created.
+async fn failing_session() -> (
+    FailingNode,
+    FailingNode,
+    SyncHandle<DummySyncMessage, DummySyncEvent>,
+    SyncSubscription<DummySyncEvent>,
+    SyncHandle<DummySyncMessage, DummySyncEvent>,
+) {
+    let topic = [0; 32].into();
+
+    let (bob_sync_config, _bob_rx) = FailingSyncArgs::new(SyncBehaviour::Wait);
+    let mut bob = FailingNode::spawn(random(), vec![], bob_sync_config).await;
+
+    let (alice_sync_config, _alice_rx) = FailingSyncArgs::new(SyncBehaviour::Error);
+    let alice = FailingNode::spawn(random(), vec![bob.args.node_info()], alice_sync_config).await;
+
+    let alice_handle = {
+        let manager_ref = call!(alice.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, alice.sync_ref.clone(), manager_ref)
+    };
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let bob_handle = {
+        let manager_ref = call!(bob.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, bob.sync_ref.clone(), manager_ref)
+    };
+
+    alice_handle.initiate_session(bob.node_id());
+
+    let event = alice_subscription.next().await.unwrap();
+    let expected_remote = bob.node_id();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 0,
+                remote,
+                event: DummySyncEvent::SessionCreated
+            }) if remote == expected_remote
+        ),
+        "{:#?}",
+        event
+    );
+
+    (alice, bob, alice_handle, alice_subscription, bob_handle)
+}
+
+#[tokio::test]
+async fn failed_sync_session_retry_asks_hooks() {
+    setup_logging();
+
+    let (alice, bob, _alice_handle, mut alice_subscription, _bob_handle) = failing_session().await;
+
+    // Alice accepted Bob when she initiated the session and changes her mind before it failed.
+    alice.block_list.block(bob.node_id()).await;
+
+    // The failed session is not retried.
+    let event = tokio::time::timeout(RETRY_OBSERVATION_WINDOW, alice_subscription.next()).await;
+    assert!(event.is_err(), "{:#?}", event);
+
+    alice.shutdown();
+    bob.shutdown();
+}
+
+#[tokio::test]
+async fn ended_sync_session_is_not_retried() {
+    setup_logging();
+
+    let (alice, bob, alice_handle, mut alice_subscription, _bob_handle) = failing_session().await;
+
+    // Alice ends the session with Bob before it failed.
+    alice_handle.end_session(bob.node_id()).unwrap();
+
+    // The failed session is not retried.
+    let event = tokio::time::timeout(RETRY_OBSERVATION_WINDOW, alice_subscription.next()).await;
+    assert!(event.is_err(), "{:#?}", event);
+
+    alice.shutdown();
+    bob.shutdown();
 }
