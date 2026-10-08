@@ -88,6 +88,22 @@ where
             .unwrap();
     }
 
+    /// Ends all sync sessions with the given node over the topic of this stream.
+    ///
+    /// Running sessions are closed gracefully and failed sessions with this node are not retried
+    /// anymore. Sync sessions with other nodes and the stream itself are not affected.
+    ///
+    /// This does not prevent future sync sessions with this node: it can still initiate a new
+    /// session itself and we will initiate one when we discover it again. To keep a node from
+    /// syncing reject it in [`SyncHooks`](crate::sync::hooks::SyncHooks) first, the hooks are
+    /// asked on every new session attempt, including retries.
+    pub fn end_session(&self, node_id: crate::NodeId) -> Result<(), SyncHandleError<M, E>> {
+        self.manager_ref
+            .send_message(ToSyncManager::EndSync(self.topic, node_id))
+            .map_err(Box::new)?;
+        Ok(())
+    }
+
     /// Close the associated sync session gracefully.
     ///
     /// This method can be awaited to ensure that all sync-related state has been cleaned up.

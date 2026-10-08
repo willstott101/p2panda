@@ -26,6 +26,10 @@ pub trait SyncHooks: std::fmt::Debug + Send + Sync {
 
     /// Intercept outgoing or incoming sync session before it is started and actual application data
     /// is exchanged.
+    ///
+    /// This is called for every attempt, including when a failed outgoing session is retried. It
+    /// is not called again for a session which is already running, use
+    /// [`SyncHandle::end_session`](crate::sync::SyncHandle::end_session) to end these.
     fn after_handshake<'a>(
         &'a self,
         _remote_node_id: NodeId,
