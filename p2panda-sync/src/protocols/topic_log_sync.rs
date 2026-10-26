@@ -7,6 +7,7 @@ use std::hash::Hash as StdHash;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_channel::mpsc;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -20,6 +21,7 @@ use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
+use tokio::time::{Instant, sleep_until};
 use tracing::{Level, debug, enabled, trace, warn};
 
 use crate::ToSync;
@@ -29,6 +31,17 @@ use crate::protocols::log_sync::{
     LogSync, LogSyncError, LogSyncEvent, LogSyncMessage, LogSyncMetrics,
 };
 use crate::traits::Protocol;
+
+/// How long a session waits for the remote to hang up after sending it `Close`.
+///
+/// Longer lets a slow peer finish cleanly; shorter bounds how long a peer that ignores
+/// `Close` holds the session open. Nothing is sent to it in that time, so all it keeps is
+/// the connection, and a shorter value fails safe: the worst a clean peer sees is the
+/// session ending without its own `Close`.
+#[cfg(not(test))]
+const CLOSE_GRACE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const CLOSE_GRACE: Duration = Duration::from_millis(100);
 
 /// Protocol for synchronizing logs which are associated with a generic T topic.
 ///
@@ -198,6 +211,7 @@ where
                 // messages and also check they are part of our topic sub-set selection before forwarding
                 // them on the event stream, or to the remote peer.
                 let mut close_sent = false;
+                let mut close_by = None;
                 self.event_tx
                     .send(TopicLogSyncEvent::LiveModeStarted)
                     .map_err(|_| TopicLogSyncChannelError::EventSend)?;
@@ -207,6 +221,9 @@ where
                         biased;
                         Some(message) = live_mode_rx.next() => {
                             match message {
+                                // Once `Close` is sent nothing more is, or a peer that
+                                // ignores it would keep receiving live operations.
+                                ToSync::Payload(_) if close_sent => continue,
                                 ToSync::Payload(operation) => {
                                     if !dedup.insert(operation.hash) {
                                         trace!(
@@ -240,9 +257,10 @@ where
                                         break result;
                                     };
                                 }
+                                ToSync::Close if close_sent => continue,
                                 ToSync::Close => {
                                     // We send the close and wait for the remote to close the
-                                    // connection.
+                                    // connection, for at most `CLOSE_GRACE`.
 
                                     debug!("closing sync session");
                                     let result = sink
@@ -253,8 +271,13 @@ where
                                         break result;
                                     };
                                     close_sent = true;
+                                    close_by = Some(Instant::now() + CLOSE_GRACE);
                                 }
                             };
+                        }
+                        _ = sleep_until(close_by.unwrap_or_else(Instant::now)), if close_by.is_some() => {
+                            debug!("remote did not close the sync session in time");
+                            break Ok(());
                         }
                         message = stream.next() => {
                             let Some(message) = message else {
@@ -1115,6 +1138,51 @@ pub mod tests {
                 _ => panic!(),
             };
         }
+    }
+
+    #[tokio::test]
+    async fn close_stops_live_mode_and_ends_without_the_remote() {
+        let log_id = 0;
+        let topic = Topic::random();
+        let mut peer = Peer::new(0).await;
+        peer.associate(&topic, &BTreeMap::default()).await;
+
+        let body = Body::from_bytes(b"Hello, Sloth!");
+        let (header, _) = peer.create_operation_no_insert(&body, log_id).await;
+
+        let (protocol, mut events_rx, mut live_mode_tx) =
+            peer.topic_sync_protocol(topic.clone(), true);
+
+        live_mode_tx.send(ToSync::Close).await.unwrap();
+        live_mode_tx
+            .send(ToSync::Payload(Operation {
+                hash: header.hash(),
+                header,
+                body: Some(body),
+            }))
+            .await
+            .unwrap();
+
+        // The remote never sends `Close` and never ends its stream.
+        let (_, remote_rx) = run_protocol_uni(
+            protocol,
+            &[
+                TestTopicSyncMessage::Sync(LogSyncMessage::Have(BTreeMap::default())),
+                TestTopicSyncMessage::Sync(LogSyncMessage::Done),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let mut finished = false;
+        while let Ok(event) = events_rx.try_recv() {
+            finished |= matches!(event, TopicLogSyncEvent::SessionFinished { .. });
+        }
+        assert!(finished);
+
+        let messages = remote_rx.collect::<Vec<_>>().await;
+        assert_eq!(messages.len(), 3);
+        std::assert_matches!(messages[2], TestTopicSyncMessage::Close);
     }
 
     #[tokio::test]
