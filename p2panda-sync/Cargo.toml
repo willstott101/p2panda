@@ -43,7 +43,7 @@ pin-project-lite = "0.2.16"
 rand = { workspace = true, optional = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, default-features = true, features = ["macros", "sync"] }
+tokio = { workspace = true, default-features = true, features = ["macros", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"], optional = true }
